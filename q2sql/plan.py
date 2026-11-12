@@ -21,7 +21,7 @@ from .errors import (
     UnsupportedContractError,
 )
 from .joins import JoinStep, find_join_path
-from .model import SemanticModel
+from .model import Metric, SemanticModel
 
 _DIGIT_STRING = re.compile(r"^-?\d+$")
 _SCALAR_OPS = ("=", "!=", "<", "<=", ">", ">=")
@@ -42,9 +42,23 @@ def coerce_literal_value(value: Any) -> Any:
 
 @dataclass(frozen=True)
 class ProjectedColumn:
+    """One column the `base` CTE exposes, under its own bare column name."""
+
     dataset: str
     column: str
-    output_name: str
+    name: str
+
+
+@dataclass(frozen=True)
+class GroupByColumn:
+    """A group_by dimension: `column` is its flat name inside `base` (normally the
+    same as the dimension's declared name, but a dimension may map to a
+    differently-named physical column); `display_name` is always the dimension's
+    declared name, which is what the output column is called.
+    """
+
+    column: str
+    display_name: str
 
 
 @dataclass(frozen=True)
@@ -64,18 +78,6 @@ class BaseCondition:
     column: str
     op: str
     value: Any
-
-
-@dataclass(frozen=True)
-class GroupByColumn:
-    """A group_by dimension: `projected` is its flattened name inside `base`
-    (possibly namespaced to avoid collisions); `display_name` is the dimension's
-    own name from the contract/model, which is what the final output column is
-    called.
-    """
-
-    projected: ProjectedColumn
-    display_name: str
 
 
 @dataclass(frozen=True)
@@ -122,31 +124,24 @@ class LogicalPlan:
 
 
 class _PlanBuilder:
-    """Collects everything build_plan needs, keeping dataset/dimension resolution
-    and join-path discovery in one deterministic, order-preserving pass.
+    """Collects everything build_plan needs: dataset/dimension/metric resolution
+    against the model, join-path discovery, and the set of columns `base` must
+    project — all in one deterministic, order-preserving pass over the contract.
     """
 
     def __init__(self, model: SemanticModel, contract: Contract):
         self.model = model
-        self.contract = contract
-        self.anchor = self._resolve_anchor()
+        self.anchor = self._resolve_anchor(contract)
         self._joins: list[JoinStep] = []
         self._joined_datasets: set[str] = {self.anchor}
-        self._projected: dict[str, ProjectedColumn] = {}  # output_name -> column
+        self._projected: dict[str, ProjectedColumn] = {}  # flat name -> column
 
-    # ---- dataset / dimension / metric resolution -----------------------------
-
-    def _resolve_anchor(self) -> str:
+    def _resolve_anchor(self, contract: Contract) -> str:
         datasets_used = []
-        for m in self.contract.metrics:
-            metric = self.model.metrics.get(m.name)
-            if metric is None:
-                raise UnknownMetricError(
-                    f"contract.metrics names unknown metric {m.name!r}; "
-                    f"declared metrics are {sorted(self.model.metrics)}"
-                )
-            if metric.dataset not in datasets_used:
-                datasets_used.append(metric.dataset)
+        for m in contract.metrics:
+            dataset = self.get_metric(m.name).dataset
+            if dataset not in datasets_used:
+                datasets_used.append(dataset)
         if len(datasets_used) > 1:
             raise UnsupportedContractError(
                 "contract.metrics reference more than one dataset "
@@ -156,7 +151,15 @@ class _PlanBuilder:
             )
         return datasets_used[0]
 
-    def _resolve_dimension(self, name: str, where: str) -> tuple[str, str]:
+    def get_metric(self, name: str) -> Metric:
+        metric = self.model.metrics.get(name)
+        if metric is None:
+            raise UnknownMetricError(
+                f"contract names unknown metric {name!r}; declared metrics are {sorted(self.model.metrics)}"
+            )
+        return metric
+
+    def resolve_dimension(self, name: str, where: str) -> tuple[str, str]:
         dim = self.model.dimensions.get(name)
         if dim is None:
             raise UnknownDimensionError(
@@ -165,46 +168,39 @@ class _PlanBuilder:
             )
         return dim.dataset, dim.column
 
-    def _ensure_joined(self, dataset: str, where: str) -> None:
+    def ensure_joined(self, dataset: str, where: str) -> None:
         if dataset in self._joined_datasets:
             return
-        path = find_join_path(self.model, self.anchor, dataset)
-        for step in path:
+        for step in find_join_path(self.model, self.anchor, dataset):
             if step.dataset not in self._joined_datasets:
                 self._joins.append(step)
                 self._joined_datasets.add(step.dataset)
 
-    def _project(self, dataset: str, column: str) -> str:
-        """Ensure (dataset, column) is projected by the base CTE; return its flat
-        output name. Idempotent: the same (dataset, column) always maps to the
-        same output name, so repeated references don't duplicate projections.
+    def project(self, dataset: str, column: str) -> str:
+        """Ensure (dataset, column) is projected by `base`, under its own bare
+        column name; idempotent. Raises if that name is already taken by a
+        *different* (dataset, column) — e.g. two joined tables both having a
+        same-named column — rather than silently colliding two columns into one.
         """
-        output_name = column if dataset == self.anchor else f"{dataset}__{column}"
-        key = f"{dataset}.{column}"
-        existing = self._projected.get(key)
-        if existing is not None:
-            return existing.output_name
-        # Guard against two different (dataset, column) pairs wanting the same
-        # flat name (only possible for anchor-dataset collisions in principle;
-        # kept as a defensive check rather than a silent overwrite).
-        for other_key, other in self._projected.items():
-            if other.output_name == output_name and other_key != key:
-                raise UnsupportedContractError(
-                    f"internal projection name clash for {output_name!r} "
-                    f"between {other_key!r} and {key!r}"
-                )
-        self._projected[key] = ProjectedColumn(dataset=dataset, column=column, output_name=output_name)
-        return output_name
+        existing = self._projected.get(column)
+        if existing is None:
+            self._projected[column] = ProjectedColumn(dataset=dataset, column=column, name=column)
+        elif (existing.dataset, existing.column) != (dataset, column):
+            raise UnsupportedContractError(
+                f"both {existing.dataset}.{existing.column} and {dataset}.{column} "
+                f"would need the base column name {column!r} — two joined tables "
+                "have a same-named column this generator can't disambiguate"
+            )
+        return column
 
-    def resolve_dimension_and_project(self, name: str, where: str) -> ProjectedColumn:
-        dataset, column = self._resolve_dimension(name, where)
-        self._ensure_joined(dataset, where)
-        output_name = self._project(dataset, column)
-        return ProjectedColumn(dataset=dataset, column=column, output_name=output_name)
+    def project_dimension(self, name: str, where: str) -> str:
+        dataset, column = self.resolve_dimension(name, where)
+        self.ensure_joined(dataset, where)
+        return self.project(dataset, column)
 
-    def project_metric_source(self, dataset: str, column: str) -> str:
-        self._ensure_joined(dataset, f"metric expression {column!r}")
-        return self._project(dataset, column)
+    def project_metric(self, metric: Metric) -> str:
+        self.ensure_joined(metric.dataset, f"metric {metric.name!r}")
+        return self.project(metric.dataset, metric.expression)
 
     @property
     def projected_columns(self) -> tuple[ProjectedColumn, ...]:
@@ -215,8 +211,7 @@ class _PlanBuilder:
         return tuple(self._joins)
 
 
-def _validate_filter_value(f: Filter, where: str) -> Any:
-    value = coerce_literal_value(f.value)
+def _coerce_filter_value(f: Filter, where: str) -> Any:
     if f.op in _LIST_OPS:
         if not isinstance(f.value, list) or len(f.value) == 0:
             raise InvalidContractError(f"{where}: op {f.op!r} requires a non-empty list value")
@@ -224,7 +219,7 @@ def _validate_filter_value(f: Filter, where: str) -> Any:
     if f.op in _SCALAR_OPS:
         if isinstance(f.value, list):
             raise InvalidContractError(f"{where}: op {f.op!r} does not take a list value")
-        return value
+        return coerce_literal_value(f.value)
     raise UnsupportedContractError(f"{where}: operator {f.op!r} is not supported")
 
 
@@ -237,47 +232,38 @@ def _check_filter_dataset_hint(f: Filter, declared_dataset: str, where: str) -> 
 
 
 def _build_base_condition(builder: _PlanBuilder, f: Filter, where: str) -> BaseCondition:
-    dataset, column = builder._resolve_dimension(f.field, where)
+    """A per-metric filter: evaluated inside a CASE WHEN at aggregation time, so it
+    references the already-flattened `base` column, not the original joined table.
+    """
+    dataset, _column = builder.resolve_dimension(f.field, where)
     _check_filter_dataset_hint(f, dataset, where)
-    output_name = builder.resolve_dimension_and_project(f.field, where).output_name
-    value = _validate_filter_value(f, where)
-    return BaseCondition(column=output_name, op=f.op, value=value)
+    column = builder.project_dimension(f.field, where)
+    return BaseCondition(column=column, op=f.op, value=_coerce_filter_value(f, where))
 
 
-def _build_raw_condition_for_dimension(
-    builder: _PlanBuilder, field: str, op: str, raw_value: Any, where: str
-) -> RawCondition:
-    dataset, column = builder._resolve_dimension(field, where)
-    builder._ensure_joined(dataset, where)
-    value = raw_value
-    if op in _LIST_OPS:
-        value = tuple(coerce_literal_value(v) for v in raw_value)
-    else:
-        value = coerce_literal_value(raw_value)
-    return RawCondition(dataset=dataset, column=column, op=op, value=value)
+def _build_raw_condition(builder: _PlanBuilder, f: Filter, where: str) -> RawCondition:
+    """A row-restricting filter: evaluated in the base CTE's own WHERE clause,
+    where the joined tables are still in scope.
+    """
+    dataset, column = builder.resolve_dimension(f.field, where)
+    _check_filter_dataset_hint(f, dataset, where)
+    builder.ensure_joined(dataset, where)
+    return RawCondition(dataset=dataset, column=column, op=f.op, value=_coerce_filter_value(f, where))
 
 
 def _build_metric_output(builder: _PlanBuilder, m: MetricRequest) -> MetricOutput:
-    metric = builder.model.metrics.get(m.name)
-    if metric is None:
-        raise UnknownMetricError(
-            f"contract metric {m.name!r} is not declared in the semantic model; "
-            f"declared metrics are {sorted(builder.model.metrics)}"
-        )
-    source_column = builder.project_metric_source(metric.dataset, metric.expression)
-    conditions = tuple(
-        _build_base_condition(builder, f, f"metric {m.alias!r} filters") for f in m.filters
-    )
+    metric = builder.get_metric(m.name)
+    source_column = builder.project_metric(metric)
+    conditions = tuple(_build_base_condition(builder, f, f"metric {m.alias!r} filters") for f in m.filters)
     return MetricOutput(alias=m.alias, agg=metric.agg, source_column=source_column, conditions=conditions)
 
 
 def _build_compare_plan(
     builder: _PlanBuilder, compare: CompareSpec, metrics: tuple[MetricRequest, ...]
-) -> tuple[ComparePlan, list[RawCondition]]:
+) -> tuple[ComparePlan, RawCondition]:
     where = "contract.compare"
-    dataset, column = builder._resolve_dimension(compare.dimension, f"{where}.dimension")
-    builder._ensure_joined(dataset, where)
-    dim_output_name = builder._project(dataset, column)
+    dataset, _column = builder.resolve_dimension(compare.dimension, f"{where}.dimension")
+    dim_column = builder.project_dimension(compare.dimension, where)
 
     periods = tuple(coerce_literal_value(p) for p in compare.periods)
     primary = coerce_literal_value(compare.primary)
@@ -285,10 +271,11 @@ def _build_compare_plan(
         raise InvalidContractError(
             f"{where}.primary ({compare.primary!r}) must be one of {where}.periods {compare.periods!r}"
         )
-    others = [p for p in periods if p != primary]
-    needs_delta = "delta" in compare.outputs
-    needs_pct = "pct_change" in compare.outputs
-    if (needs_delta or needs_pct) and len(periods) != 2:
+    other_period = next((p for p in periods if p != primary), None)
+    want_values = "values" in compare.outputs
+    want_delta = "delta" in compare.outputs
+    want_pct = "pct_change" in compare.outputs
+    if (want_delta or want_pct) and len(periods) != 2:
         raise UnsupportedContractError(
             f"{where}: delta/pct_change require exactly 2 periods, got {len(periods)} ({periods!r})"
         )
@@ -296,72 +283,56 @@ def _build_compare_plan(
     pivots: list[ComparePivot] = []
     derived: list[CompareDerived] = []
     value_aliases: list[str] = []
-    want_values = "values" in compare.outputs
 
     for m in metrics:
-        metric = builder.model.metrics.get(m.name)
-        if metric is None:
-            raise UnknownMetricError(
-                f"contract metric {m.name!r} is not declared in the semantic model; "
-                f"declared metrics are {sorted(builder.model.metrics)}"
-            )
-        source_column = builder.project_metric_source(metric.dataset, metric.expression)
-        metric_filter_conditions = tuple(
-            _build_base_condition(builder, f, f"metric {m.alias!r} filters") for f in m.filters
-        )
-        period_columns: dict[Any, str] = {}
+        metric = builder.get_metric(m.name)
+        source_column = builder.project_metric(metric)
+        metric_filters = tuple(_build_base_condition(builder, f, f"metric {m.alias!r} filters") for f in m.filters)
+
+        column_by_period: dict[Any, str] = {}
         for period in periods:
             col_alias = f"{m.alias}_{period}"
-            conditions = (BaseCondition(column=dim_output_name, op="=", value=period),) + metric_filter_conditions
+            period_filter = BaseCondition(column=dim_column, op="=", value=period)
             pivots.append(
-                ComparePivot(column_alias=col_alias, agg=metric.agg, source_column=source_column, conditions=conditions)
+                ComparePivot(
+                    column_alias=col_alias, agg=metric.agg, source_column=source_column,
+                    conditions=(period_filter, *metric_filters),
+                )
             )
-            period_columns[period] = col_alias
+            column_by_period[period] = col_alias
             if want_values:
                 value_aliases.append(col_alias)
 
-        if needs_delta or needs_pct:
-            other = others[0]
-            primary_col = period_columns[primary]
-            other_col = period_columns[other]
-            if needs_delta:
-                derived.append(
-                    CompareDerived(alias=f"{m.alias}_delta", kind="delta", primary_column=primary_col, other_column=other_col)
-                )
-            if needs_pct:
-                derived.append(
-                    CompareDerived(
-                        alias=f"{m.alias}_pct_change", kind="pct_change", primary_column=primary_col, other_column=other_col
-                    )
-                )
+        if want_delta or want_pct:
+            primary_col, other_col = column_by_period[primary], column_by_period[other_period]
+            if want_delta:
+                derived.append(CompareDerived(f"{m.alias}_delta", "delta", primary_col, other_col))
+            if want_pct:
+                derived.append(CompareDerived(f"{m.alias}_pct_change", "pct_change", primary_col, other_col))
 
-    compare_plan = ComparePlan(pivots=tuple(pivots), value_column_aliases=tuple(value_aliases), derived=tuple(derived))
-
-    period_filter = _build_raw_condition_for_dimension(builder, compare.dimension, "in", list(periods), where)
-    return compare_plan, [period_filter]
+    plan = ComparePlan(pivots=tuple(pivots), value_column_aliases=tuple(value_aliases), derived=tuple(derived))
+    period_filter = RawCondition(dataset=dataset, column=_column, op="in", value=periods)
+    return plan, period_filter
 
 
 def build_plan(model: SemanticModel, contract: Contract) -> LogicalPlan:
     builder = _PlanBuilder(model, contract)
 
-    group_by_cols = [
-        GroupByColumn(
-            projected=builder.resolve_dimension_and_project(name, f"contract.group_by[{i}]"),
-            display_name=name,
-        )
+    group_by = tuple(
+        GroupByColumn(column=builder.project_dimension(name, f"contract.group_by[{i}]"), display_name=name)
         for i, name in enumerate(contract.group_by)
-    ]
+    )
 
-    raw_where: list[RawCondition] = [
-        _build_raw_condition_for_dimension(builder, f.field, f.op, f.value, f"contract.filters[{i}] ({f.field!r})")
+    base_where = [
+        _build_raw_condition(builder, f, f"contract.filters[{i}] ({f.field!r})")
         for i, f in enumerate(contract.filters)
     ]
 
     compare_plan: ComparePlan | None = None
     metrics: tuple[MetricOutput, ...] = ()
     if contract.compare is not None:
-        compare_plan, extra_where = _build_compare_plan(builder, contract.compare, contract.metrics)
-        raw_where.extend(extra_where)
+        compare_plan, period_filter = _build_compare_plan(builder, contract.compare, contract.metrics)
+        base_where.append(period_filter)
     else:
         metrics = tuple(_build_metric_output(builder, m) for m in contract.metrics)
 
@@ -369,15 +340,15 @@ def build_plan(model: SemanticModel, contract: Contract) -> LogicalPlan:
     if totals is not None:
         if totals != "grand":
             raise UnsupportedContractError(f"contract.totals value {totals!r} is not supported (only 'grand' is)")
-        if not group_by_cols:
+        if not group_by:
             raise UnsupportedContractError("contract.totals requires at least one contract.group_by dimension")
 
     return LogicalPlan(
         anchor=builder.anchor,
         joins=builder.joins,
         base_projected_columns=builder.projected_columns,
-        base_where=tuple(raw_where),
-        group_by=tuple(group_by_cols),
+        base_where=tuple(base_where),
+        group_by=group_by,
         metrics=metrics,
         compare=compare_plan,
         totals=totals,

@@ -1,7 +1,7 @@
 WITH "base" AS (
   SELECT
-    "dim_store"."region" AS "dim_store__region",
-    "dim_calendar"."fiscal_year" AS "dim_calendar__fiscal_year",
+    "dim_store"."region" AS "region",
+    "dim_calendar"."fiscal_year" AS "fiscal_year",
     "fact_sales"."revenue" AS "revenue"
   FROM "fact_sales"
   LEFT JOIN "dim_store" ON "fact_sales"."store_id" = "dim_store"."store_id"
@@ -11,17 +11,17 @@ WITH "base" AS (
 SELECT "region", "total_revenue_2025", "total_revenue_2026", ("total_revenue_2026" - "total_revenue_2025") AS "total_revenue_delta", CAST(("total_revenue_2026" - "total_revenue_2025") AS DOUBLE PRECISION) / NULLIF("total_revenue_2025", 0) AS "total_revenue_pct_change"
 FROM (
   SELECT
-    "dim_store__region" AS "region",
-    SUM(CASE WHEN "dim_calendar__fiscal_year" = 2025 THEN "revenue" END) AS "total_revenue_2025",
-    SUM(CASE WHEN "dim_calendar__fiscal_year" = 2026 THEN "revenue" END) AS "total_revenue_2026",
+    "region" AS "region",
+    SUM(CASE WHEN "fiscal_year" = 2025 THEN "revenue" END) AS "total_revenue_2025",
+    SUM(CASE WHEN "fiscal_year" = 2026 THEN "revenue" END) AS "total_revenue_2026",
     0 AS "__sort_key"
   FROM "base"
-  GROUP BY "dim_store__region"
+  GROUP BY "region"
   UNION ALL
   SELECT
     'Total' AS "region",
-    SUM(CASE WHEN "dim_calendar__fiscal_year" = 2025 THEN "revenue" END) AS "total_revenue_2025",
-    SUM(CASE WHEN "dim_calendar__fiscal_year" = 2026 THEN "revenue" END) AS "total_revenue_2026",
+    SUM(CASE WHEN "fiscal_year" = 2025 THEN "revenue" END) AS "total_revenue_2025",
+    SUM(CASE WHEN "fiscal_year" = 2026 THEN "revenue" END) AS "total_revenue_2026",
     1 AS "__sort_key"
   FROM "base"
 ) AS "combined"

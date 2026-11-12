@@ -257,15 +257,15 @@ From `make bench` (2000 iterations per contract/dialect after 200 warmup iterati
 
 ```
 -- given semantic model (3 datasets, 2 metrics, 3 dimensions) --
-A (aliased metrics) [duckdb]           p50=  0.0308ms  p95=  0.0363ms  p99=  0.0648ms  max=  0.0736ms
-B (compare + totals) [duckdb]          p50=  0.0449ms  p95=  0.0526ms  p99=  0.0823ms  max=  0.8163ms
-C (distinct count + totals) [duckdb]   p50=  0.0275ms  p95=  0.0306ms  p99=  0.0660ms  max=  0.0841ms
-A (aliased metrics) [postgres]         p50=  0.0308ms  p95=  0.0360ms  p99=  0.0662ms  max=  0.0732ms
-B (compare + totals) [postgres]        p50=  0.0467ms  p95=  0.0539ms  p99=  0.0870ms  max=  0.1058ms
-C (distinct count + totals) [postgres] p50=  0.0280ms  p95=  0.0311ms  p99=  0.0696ms  max=  0.0898ms
+A (aliased metrics) [duckdb]           p50=  0.0274ms  p95=  0.0324ms  p99=  0.0595ms  max=  0.0633ms
+B (compare + totals) [duckdb]          p50=  0.0441ms  p95=  0.0514ms  p99=  0.0779ms  max=  0.7646ms
+C (distinct count + totals) [duckdb]   p50=  0.0270ms  p95=  0.0294ms  p99=  0.0642ms  max=  0.0675ms
+A (aliased metrics) [postgres]         p50=  0.0292ms  p95=  0.0333ms  p99=  0.0635ms  max=  0.0797ms
+B (compare + totals) [postgres]        p50=  0.0455ms  p95=  0.0520ms  p99=  0.0865ms  max=  0.1092ms
+C (distinct count + totals) [postgres] p50=  0.0276ms  p95=  0.0307ms  p99=  0.0660ms  max=  0.0763ms
 
 -- synthetic large model (50 datasets, 500 metrics, 500 dimensions) --
-synthetic (3 metrics, 3 group_by, totals) [duckdb] p50=  1.3545ms  p95=  1.4215ms  p99=  1.9214ms  max=  2.2614ms
+synthetic (3 metrics, 3 group_by, totals) [duckdb] p50=  1.3386ms  p95=  1.3879ms  p99=  1.9143ms  max=  2.0838ms
 
 All p99 under 10ms: True
 ```
