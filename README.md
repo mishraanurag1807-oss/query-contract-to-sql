@@ -10,7 +10,7 @@ generate_sql(semantic_model: dict, contract: dict, dialect: str) -> str
 ## 1. How to run
 
 ```
-make venv   # creates .venv, installs duckdb + pytest (Python 3.11+ required)
+make venv   # optional: creates .venv with duckdb + pytest (any Python 3.11+); the targets below do it automatically
 make demo   # loads the brief's data into DuckDB, runs contracts A/B/C, prints SQL + results
 make test   # runs the whole test suite (43 tests)
 make bench  # prints measured generation times (p50/p95/p99/max)
